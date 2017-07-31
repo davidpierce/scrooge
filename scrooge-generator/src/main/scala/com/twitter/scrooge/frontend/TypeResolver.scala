@@ -17,6 +17,7 @@
 package com.twitter.scrooge.frontend
 
 import com.twitter.scrooge.ast._
+
 import scala.collection.mutable.ArrayBuffer
 import scala.util.parsing.input.{NoPosition, Positional}
 
@@ -107,15 +108,20 @@ case class TypeResolver(
     typeMap: Map[String, FieldType] = Map.empty,
     constMap: Map[String, ConstDefinition] = Map.empty,
     serviceMap: Map[String, Service] = Map.empty,
-    includeMap: Map[String, ResolvedDocument] = Map.empty) {
+    includeMap: Map[String, ResolvedDocument] = Map.empty,
+    resolveForwardReferences: Boolean = false) {
 
   protected def getResolver(includePath: String, pos: Positional = new Positional { pos = NoPosition }): TypeResolver = {
     includeMap.getOrElse(includePath, throw new QualifierNotFoundException(includePath, pos)).resolver
   }
 
-  def resolveFieldType(id: Identifier): FieldType = id match {
-    case SimpleID(name, _) => typeMap.getOrElse(name, throw new TypeNotFoundException(name, id))
-    case qid: QualifiedID => getResolver(qid.names.head, qid).resolveFieldType(qid.tail)
+  def resolveFieldType(id: Identifier): FieldType = {
+    def forwardReference(name: String, id: Identifier) =
+      if (!resolveForwardReferences) ReferenceType(id) else throw new TypeNotFoundException(name, id)
+    id match {
+      case SimpleID(name, _) => typeMap.getOrElse(name, forwardReference(name, id))
+      case qid: QualifiedID => getResolver(qid.names.head, qid).resolveFieldType(qid.tail)
+    }
   }
 
   def resolveServiceParent(parent: ServiceParent): Service =
@@ -151,6 +157,16 @@ case class TypeResolver(
     copy(typeMap = typeMap + (name -> fieldType))
   }
 
+  def withType(definition: Definition, fieldType: FieldType): TypeResolver = {
+    val name = definition.sid.name
+    if (!resolveForwardReferences && typeMap.contains(name)) {
+      throw new DuplicatedIdentifierException(
+        s"Detected a duplicated identifier [${name}] for differing types: ${definition}, ${typeMap(name)}",
+        definition)
+    }
+    withType(name, fieldType)
+  }
+
   /**
    * Returns a new TypeResolver with the given constant added.
    */
@@ -184,13 +200,20 @@ case class TypeResolver(
       }
     }
 
+    // 1st pass allows forward type references
     for (d <- doc.defs) {
       val ResolvedDefinition(d2, r2) = resolver(d, scopePrefix)
       resolver = r2
       defBuf += d2
     }
+    // 2nd pass resolves forward type references
+    val resolver2 = resolver.copy(resolveForwardReferences = true)
+    val defs2 = for {
+      d <- defBuf
+      ResolvedDefinition(d2, _) = resolver2(d, scopePrefix)
+    } yield d2
 
-    ResolvedDocument(doc.copy(defs = defBuf.toSeq), resolver)
+    ResolvedDocument(doc.copy(defs = defs2), resolver2)
   }
 
   /**
